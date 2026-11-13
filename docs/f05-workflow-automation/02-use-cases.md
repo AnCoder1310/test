@@ -1,0 +1,536 @@
+# Actors, Roles, Use Cases — Workflow & Automation
+
+> Design status: TARGET V1
+>
+> Scope: F05 Workflow & Automation (UC-WF-01 … UC-WF-11)
+
+## Actors / roles
+
+| Role code | Display name | Workflow responsibilities |
+|---|---|---|
+| `ADMIN` | Administrator | Configures workload scoring, SLA, and the AI processing scope (AI actions, whitelist, entitlement catalog); reviews AI decisions |
+| `TECHNICIAN` | Technician | Handles requests that need a human and automation failures; keeps their **availability status** up to date |
+| `REQUESTER` | Requester | Submits requests, answers AI questions, confirms results |
+
+| System actor | Audit code | Responsibilities |
+|---|---|---|
+| AI Service | `AI` | Classifies tickets with a confidence score, extracts information, asks for clarification when not confident, **approves basic in-scope requests**, summarizes tickets for technicians |
+
+> The system has 3 user roles and **exactly 1 system actor: the AI Service**.
+>
+> Automated tasks (choosing the team and technician, SLA timers, API execution, verification) are **internal system behavior**, not actors; they are logged with source `AUTOMATION` (BR-WF-05). The external access-management system (AD, Google Workspace, mock API…) is an **integration detail** reached through connectors.
+>
+> **There is no Team Lead.** Nobody distributes work by hand: the system assigns tickets from each technician's availability and workload (see *Assignment by availability and workload*). The Admin is the only person who can reassign manually, as a last resort.
+
+## What F05 reads from each ticket
+
+F05 does not read the raw ticket itself: it acts on the **AI analysis** produced by F04 (UC-AI-01) for every new ticket and every requester answer. The analysis covers the **full ticket** — the request, the requester and the source — and is the only input of the routing decision (BR-WF-19).
+
+| Group | Fields used by F05 | Used for |
+|---|---|---|
+| **Source** | `channel` (`EMAIL` support mailbox or `PORTAL`), `createdBy` (e.g. a Helpdesk agent logging a phone call) | Shown on the ticket; an unknown sender (`UNKNOWN_SENDER`) is never automated |
+| **Requester** | `requester`, `requestedFor` (beneficiary), business unit, department, site | Policy check (BR-WF-16), auto-filled fields |
+| **Request** | `requestType`, `category` = `domain/subcategory`, `supportLevel` (`L1` / `L2`), extracted fields, `missingFields` | Flow choice, group and sub-group, AI agent |
+| **Confidence and reason** | `confidence`, `suggestedRoute`, `routeReason`, suggested priority with its reason | Flow choice, priority (BR-WF-20) |
+
+**Support level** (computed by F04 from a fixed table, not guessed): `L1` = Helpdesk domain (devices, accounts and access, email, phone, network, printers); `L2` = an application domain (SAP, …) or a business requirement. F05 uses it to pick the AI agent and the team, and shows it on the ticket.
+
+### Fields filled automatically
+
+When `AUTO_FILL_FIELDS` is enabled (UC-WF-03), F05 writes the analysis into the ticket fields shown by F03 — request type, category, subcategory, support level, requested for, business unit, site and priority — each marked **"Filled by AI"** (BR-WF-21). The requester never has to pick a category. A field the AI could not fill with enough confidence stays empty and is asked for (flow B). A technician or the Admin can correct any filled field with a reason; a correction of category or support level before work starts re-routes the ticket.
+
+### Priority set automatically
+
+F05 **sets** the priority (it does not only suggest it) when `SET_PRIORITY` is enabled (BR-WF-20):
+
+- the AI's priority, based only on impact and urgency (BR-AI-09), is applied when its confidence ≥ the threshold;
+- otherwise the default priority **P2 — Medium** is applied;
+- the SLA policy of that priority is attached right away (UC-WF-02);
+- a technician or the Admin can change the priority with a mandatory reason; the SLA is recalculated (BR-WF-08).
+
+## Routing principles
+
+About **8,000 tickets per day** are routed by the AI Service into three flows. The ticket is owned either by the **AI agent of its domain** (agent-first, F04 UC-AI-10) or by a **technician**:
+
+| Flow | Condition | Owner | Handling |
+|---|---|---|---|
+| **A — AI self-service** | Confidence ≥ threshold, request type is in the whitelist, **policy check passes** — or a how-to / self-service fix the domain agent can answer from the KB | **AI agent** of the domain | AI approves → system calls the API → verification → requester confirms; or cited KB answer (F04) |
+| **B — Clarification** | Confidence < threshold, or required information is missing | **AI agent** of the domain | AI asks the requester → requester answers → re-route (max 2 rounds) |
+| **C — Human handling** | Needs a human (hardware…), outside the whitelist, policy check fails, suspected bug, software requirement, or still unclear after 2 rounds | **Technician** of the group / sub-group | Automatic technician assignment with an AI summary |
+
+**AI approval has two steps** (BR-WF-02):
+
+1. **AI understands the request:** classifies it and extracts the beneficiary, target system, entitlement / account type and duration.
+2. **Deterministic policy check (no AI involved):** the action is in the whitelist, the entitlement is in the beneficiary's department catalog, the duration does not exceed the maximum, and the beneficiary is valid. Pass → approve; fail → flow C.
+
+As a result, even if the AI misunderstands a request, the system cannot grant access outside the scope configured by the Admin.
+
+```mermaid
+flowchart TD
+    t["New ticket (~8,000/day)"] --> ai["AI Service classifies<br/>+ extracts information"]
+    ai --> conf{"Confidence ≥ threshold<br/>and information complete?"}
+    conf -- "No" --> ask{"Clarification rounds<br/>< 2?"}
+    ask -- "Yes" --> b["Flow B: AI asks the requester"]
+    b --> ai
+    ask -- "No" --> c
+    conf -- "Yes" --> human{"Needs a human?<br/>(hardware, outside whitelist)"}
+    human -- "Yes" --> c["Flow C: assign a technician"]
+    human -- "No" --> policy{"Policy check<br/>(entitlements, duration, beneficiary)"}
+    policy -- "Fail" --> c
+    policy -- "Pass" --> a["Flow A: AI approves"]
+    a --> exec["Execute via API"]
+    exec --> verify{"Verification OK?"}
+    verify -- "Yes" --> done["Requester confirms → closed"]
+    verify -- "No" --> c
+
+    classDef auto fill:#e8f1fc,color:#123,stroke:#3a7bd5
+    classDef human fill:#fdecea,color:#5a1a14,stroke:#d9534f
+    classDef askc fill:#fff6e0,color:#5a4300,stroke:#e0a800
+    class a,exec,done auto
+    class c human
+    class b askc
+```
+
+## Assignment by availability and workload
+
+A ticket in flow C is assigned by **deterministic rules**, not by the AI and not by a person. The AI only classifies the ticket; the rules below decide who gets it (BR-WF-09, BR-WF-10, BR-WF-18).
+
+### Which owner: group → sub-group → AI agent or technician
+
+There are **no assignment rules to configure**. The AI category has two parts, `domain/subcategory` (F04), and F09 User Management organizes teams the same way (BR-WF-09):
+
+| Level | Comes from | Example |
+|---|---|---|
+| **Group** | the `domain` of the category; each group owns one or more domains (F09) | `HELPDESK` → IT Helpdesk group |
+| **Sub-group** | the `subcategory`; each sub-group declares the subcategories it handles (F09) | `HELPDESK/PRINTER` → Printer sub-group |
+| **AI agent** | the domain agent of the group (F04), when `AGENT_FIRST` is on for that domain | Helpdesk agent |
+| **Technician** | a member of the sub-group (or of the group if no sub-group handles the subcategory), chosen by status and workload | Hung |
+
+1. The ticket is placed in the **group** of its domain and, when one exists, the **sub-group** of its subcategory.
+2. If the domain has an enabled **AI agent**, the agent owns the ticket first (flows A and B).
+3. The ticket goes to a **technician** of the sub-group — or of the group when no sub-group handles the subcategory — when it enters flow C.
+4. If no group owns the domain, or the AI could not classify the ticket, the ticket goes to the **default support team** (configured in UC-WF-01) and is handled by a technician.
+
+### Technician availability status
+
+There are only **two statuses**:
+
+| Status | Meaning | Receives new tickets? |
+|---|---|---|
+| `ON` | On shift and taking work | Yes |
+| `OFF` | Not taking work: off shift, on leave, sick, or away (meeting, on site) | No; their not-started tickets are moved to colleagues, tickets in progress stay with them |
+
+The status is set by the technician (top bar ON/OFF switch) and automatically by the system: `OFF` outside working hours of the business calendar and on registered leave, `ON` at the start of the shift. A technician who steps away for a while simply switches to `OFF`. The status itself is owned by F09 User Management; F05 reads it.
+
+### Workload score
+
+Counting tickets is not enough: three high-priority, complex tickets weigh more than five small ones. Each open ticket gets a **load score = priority points × complexity factor**; a technician's workload is the sum over their open tickets (`ASSIGNED`, `IN_PROGRESS`).
+
+The system has **three priority levels** (there is no "critical" level):
+
+| Priority | Points |
+|---|---|
+| P1 — High | 3 |
+| P2 — Medium | 2 |
+| P3 — Low | 1 |
+
+| Complexity | Factor | Examples |
+|---|---|---|
+| Simple | ×1 | Replace a mouse, install a printer |
+| Medium | ×1.5 | Reinstall software, network issue on one PC |
+| Complex | ×2 | Server failure, incident affecting many users |
+
+In V1 the complexity comes from the **request type**, configured by the Admin (e.g. "Server" = Complex). AI-estimated complexity is out of scope for V1. All numbers are defaults that the Admin can change (UC-WF-01).
+
+*Example:* Mai holds 3 tickets P1 Complex → 3 × (3×2) = **18**; Hung holds 5 tickets P3 Simple → 5 × 1 = **5**. A new "broken mouse" ticket goes to **Hung**, although he holds more tickets.
+
+### Selection rule
+
+1. Keep members of the sub-group of the ticket's subcategory — or of the group of its domain when no sub-group handles it, or of the default support team.
+2. Remove technicians who are `OFF`.
+3. Remove technicians whose workload has reached the **maximum load** (default 20).
+4. Pick the technician with the **lowest workload score**; on a tie, the one who received a ticket least recently.
+5. Nobody left → the ticket waits in the team queue (`ASSIGNED` to the team, no individual); the first technician who becomes eligible receives it.
+
+```mermaid
+flowchart TD
+    t["Ticket in flow C"] --> rule["domain → group, subcategory → sub-group<br/>(no group → default support team)"]
+    rule --> f1["Keep members who are ON"]
+    f1 --> f2["Drop members at maximum load"]
+    f2 --> any{"Anyone left?"}
+    any -- "Yes" --> pick["Lowest workload score<br/>→ ASSIGNED to that technician"]
+    any -- "No" --> wait["Waits in the team queue<br/>first eligible technician gets it"]
+```
+
+## Role × feature matrix
+
+| Feature | Admin | Technician | Requester |
+|---|---|---|---|
+| Configure SLA and business calendar | ✓ | | |
+| Configure AI scope (AI actions, whitelist, entitlement catalog) | ✓ | | |
+| View AI decisions and their grounds | ✓ | Assigned tickets | Own tickets (summary reason) |
+| Configure workload scoring (priority points, complexity by request type, maximum load) | ✓ | | |
+| Set own availability status | | ✓ | |
+| Reassign tickets manually (last resort, reason required) | ✓ | | |
+| Correct an AI-filled field or the priority (reason required) | ✓ | Assigned tickets | |
+| See source, support level, priority and owner (AI agent or technician) of a ticket | ✓ | Assigned tickets | Own tickets |
+| Receive reminders / SLA warnings | | ✓ | ✓ (when the AI is waiting for them) |
+| Receive SLA breach escalations | ✓ | | |
+| Submit requests | ✓ | ✓ | ✓ |
+| Answer AI questions | ✓ | ✓ | ✓ (own tickets) |
+| Retry / resolve manually on failure | ✓ | Assigned tickets | |
+| See duplicate / related tickets linked by the system | ✓ | Assigned tickets | Own tickets only |
+| Undo a merge ("Not the same problem") | | | Own merged ticket, within 7 days |
+| Unlink related tickets (reason required) | ✓ | Assigned tickets | |
+| Configure duplicate handling (on/off, threshold, burst) | ✓ | | |
+| Return a misrouted ticket for re-routing (reason required) | ✓ | Assigned tickets | |
+| See the routing history of a ticket | ✓ | Assigned tickets | Own tickets (summary) |
+| Configure automatic re-routing (on/off, maximum re-routes) | ✓ | | |
+| Confirm result / report not fixed | | | Own tickets |
+
+Menus and buttons are hidden when the user lacks permission. Unauthorized URL access → `#/403`. **The backend enforces authorization**; hiding frontend controls serves UI/UX only.
+
+## Use Case Diagram
+
+```mermaid
+flowchart LR
+    subgraph left["Actors"]
+        direction TB
+        admin(["Admin"])
+        tech(["Technician"])
+    end
+
+    subgraph system["Workflow & Automation — System Boundary"]
+        direction TB
+        subgraph config["Configuration"]
+            direction LR
+            uc01["UC-WF-01 Configure workload scoring"]
+            uc02["UC-WF-02 Configure SLA"]
+            uc03["UC-WF-03 Configure AI processing scope"]
+        end
+        subgraph routing["Routing & dispatch"]
+            direction LR
+            uc04["UC-WF-04 Route ticket"]
+            uc05["UC-WF-05 Auto-assign technician"]
+            uc06["UC-WF-06 SLA reminders & warnings"]
+            uc10["UC-WF-10 Handle duplicate / similar tickets"]
+            uc11["UC-WF-11 AI re-routes on failure or misroute"]
+        end
+        subgraph automation["Automated handling"]
+            direction LR
+            uc07["UC-WF-07 AI approves in-scope request"]
+            uc08["UC-WF-08 Execute via API"]
+            uc09["UC-WF-09 Verify / hand off on failure"]
+        end
+    end
+
+    subgraph right["Actors"]
+        direction TB
+        requester(["Requester"])
+        ai(["AI Service"])
+    end
+
+    admin --> uc01 & uc02 & uc03 & uc05 & uc10 & uc11
+    tech --> uc05 & uc06 & uc09 & uc10 & uc11
+    requester --> uc04 & uc06 & uc08 & uc09 & uc10
+    ai --> uc04 & uc05 & uc07 & uc10 & uc11
+
+    classDef actor fill:#666,color:#fff,stroke:#333
+    classDef sysactor fill:#8a5cf6,color:#fff,stroke:#5b34c9
+    classDef usecase fill:#1168bd,color:#fff,stroke:#0b4f9e
+    classDef core fill:#0b4f9e,color:#fff,stroke:#062f5e,stroke-width:3px
+    class admin,tech,requester actor
+    class ai sysactor
+    class uc01,uc02,uc03,uc06,uc09,uc10,uc11 usecase
+    class uc04,uc05,uc07,uc08 core
+    style left fill:#fff,stroke:#bbb,stroke-dasharray:5 5
+    style right fill:#fff,stroke:#bbb,stroke-dasharray:5 5
+    style system fill:#f8fbff,stroke:#1168bd,stroke-dasharray:5 5
+```
+
+Thick border: core business use cases. Purple: system actor (AI Service). UC-WF-05, 06, 08, 09, 10 and 11 are triggered automatically by the system; the connected actors are those who benefit from the result or act on it (reassign, retry, confirm).
+
+### Shared rules and constraints
+
+```mermaid
+flowchart LR
+    auth["Authenticate session"]:::shared
+    authorize["Check RBAC"]:::shared
+    validate["Validate input"]:::shared
+    audit["Write audit log (source USER / AI / AUTOMATION)"]:::shared
+    whitelist["Whitelist check"]:::rule
+    policy["Deterministic policy check"]:::rule
+    idem["Idempotency key"]:::rule
+
+    configUc["UC-WF-01..03 Configuration"] --> auth & authorize & validate & audit
+    routeUc["UC-WF-04 Routing"] --> audit
+    approveUc["UC-WF-07 AI approval"] --> whitelist & policy & audit
+    execUc["UC-WF-08 API execution"] --> whitelist & policy & idem & audit
+    retryUc["UC-WF-09 Manual retry"] --> auth & authorize & policy & idem & audit
+
+    classDef shared fill:#1168bd,color:#fff,stroke:#0b4884
+    classDef rule fill:#e8f1fc,color:#123,stroke:#3a7bd5
+```
+
+## Related states
+
+### Ticket status (workflow-controlled part)
+
+| Status | Meaning |
+|---|---|
+| `NEW` | Just created, waiting for AI classification |
+| `NEEDS_INFO` | AI is asking the requester for clarification — **SLA paused** |
+| `ASSIGNED` | Assigned to a technician, or waiting in the team queue when no technician is eligible |
+| `IN_PROGRESS` | Technician is working on it |
+| `AUTOMATING` | AI approved; the system is executing / verifying via API |
+| `RESOLVED` | Handled, waiting for requester confirmation |
+| `CLOSED` | Closed |
+| `CANCELLED` | Cancelled by the requester |
+
+### AI decision (`ai_decisions.outcome`)
+
+| Value | Meaning | Flow |
+|---|---|---|
+| `AUTO_APPROVED` | Confidence and policy check passed | A |
+| `NEEDS_INFO` | Not confident or information missing | B |
+| `ROUTE_TO_HUMAN` | Needs a human / outside whitelist / policy check failed / clarification limit reached | C |
+
+Each decision stores: category, confidence, extracted information, result of each policy condition, and reason.
+
+### Workflow run status (`workflow_runs.status`)
+
+`QUEUED` → `RUNNING` → (`RETRY_WAIT` → `RUNNING`)* → `VERIFYING` → `SUCCEEDED`
+Failure branch: `FAILED` → `QUEUED` (manual retry) | `MANUALLY_RESOLVED`
+
+```mermaid
+stateDiagram-v2
+    [*] --> NEW
+    NEW --> NEEDS_INFO: AI not confident / information missing
+    NEEDS_INFO --> NEW: requester answers → re-route
+    NEW --> AUTOMATING: AI approves (flow A)
+    NEW --> ASSIGNED: route to human (flow C)
+    AUTOMATING --> RESOLVED: execution + verification OK
+    AUTOMATING --> ASSIGNED: permanent error / retries exhausted → technician
+    ASSIGNED --> IN_PROGRESS: technician starts
+    IN_PROGRESS --> AUTOMATING: technician retries automation
+    ASSIGNED --> ASSIGNED: AI re-routes to another group (UC-WF-11)
+    IN_PROGRESS --> ASSIGNED: returned as misrouted → AI re-routes (UC-WF-11)
+    IN_PROGRESS --> RESOLVED: technician done
+    RESOLVED --> CLOSED: requester confirms
+    RESOLVED --> IN_PROGRESS: requester reports not fixed
+    NEEDS_INFO --> CLOSED: no response after N days
+    NEW --> CLOSED: duplicate of the requester's own open ticket (merged)
+    CLOSED --> NEW: requester says "Not the same problem" (within 7 days)
+    NEW --> CANCELLED: requester cancels
+    CLOSED --> [*]
+    CANCELLED --> [*]
+```
+
+## Use cases
+
+### UC-WF-01 Configure workload scoring
+
+> Assignment rules ("ticket type → team") were **removed**: the team comes from the AI category and the categories each team is responsible for (F09). This use case now only configures how the technician inside the team is chosen.
+
+- **Actor:** Admin
+- **Preconditions:** logged in as `ADMIN`; at least one technical team has active members and responsible categories (F09)
+- **Main flow:** open SCR-WF-01 *Workload settings* → edit the priority points (P1–P3), the complexity of each request type (Simple / Medium / Complex) and its factor, the maximum load per technician, and the **default support team** for tickets whose category has no responsible team → `updateWorkloadSettings` → audit
+- **Secondary flow — preview:** choose a sample ticket → `previewAssignment` → shows the AI category, the responsible team, each member's status (`ON` / `OFF`) and workload score, who is excluded and why, and the expected technician; no data is changed
+- **Exceptions:** points, factors or maximum load ≤ 0 → `400`; a request type without a complexity → `400`; no default support team, or the default team has no active members → `400`
+- **Permission:** `workflowConfigManage`
+- **Result:** new settings apply from the next assignment; tickets already assigned are not moved
+
+### UC-WF-02 Configure SLA policies
+
+- **Actor:** Admin
+- **Preconditions:** logged in as `ADMIN`
+- **Main flow:** open SCR-WF-02 → choose a priority (P1–P3) → enter first-response time, resolution time, warning threshold (%) → choose a business calendar (working hours, holidays) → `updateSlaPolicy` → a new policy version is saved → audit
+- **Suggested defaults** (three levels; there is no "critical" level):
+
+  | Priority | First response | Resolution | Warning threshold |
+  |---|---|---|---|
+  | P1 — High | 1 hour | 8 business hours | 75% |
+  | P2 — Medium | 4 business hours | 3 business days | 75% |
+  | P3 — Low | 8 business hours | 5 business days | 75% |
+
+- **Exceptions:** resolution time < response time, threshold outside 1–99% → `400`
+- **Permission:** `workflowConfigManage`
+- **Result:** new tickets, or tickets whose priority changes after saving, use the new version; open tickets keep their attached version (BR-WF-08)
+
+### UC-WF-03 Configure the AI processing scope
+
+- **Actor:** Admin
+- **Preconditions:** logged in as `ADMIN`; connectors to the external access-management system are declared in deployment configuration (secrets are never entered through the UI)
+- **Main flow — AI actions:** SCR-WF-03 tab *AI actions* → enable/disable each action (`AUTO_CLASSIFY`, `AUTO_FILL_FIELDS`, `SET_PRIORITY`, `ASK_FOR_INFO`, `AUTO_APPROVE`, `SUGGEST_KB`) and, **per domain**, `AGENT_FIRST` (the domain's AI agent owns the ticket before any technician) → set the confidence threshold (0.00–1.00), the default priority when the AI is not confident (default P2), and the maximum clarification rounds (default 2) → `updateAiActionSetting` → audit
+- **Main flow — duplicates:** same tab → enable/disable `HANDLE_DUPLICATES` → set the duplicate threshold (default 0.85, shared with F04) and the burst rule (default 5 similar open tickets within 60 minutes) → `updateAiActionSetting` → audit
+- **Main flow — re-routing:** same tab → enable/disable `AUTO_REROUTE` → set the maximum number of re-routes per ticket (default 2) → `updateAiActionSetting` → audit
+- **Main flow — whitelist:** tab *Automation actions* → *Add* → enter request type, connector, operation, required parameters, maximum access duration, fallback team on failure → `createAutomationAction` → audit. V1 operations:
+
+  | Operation | Meaning | Changes data? |
+  |---|---|---|
+  | `CHECK_ACCOUNT` | Check account status (exists, locked, current access) and return it to the requester | No (read-only) |
+  | `CREATE_ACCOUNT` | Create a new account from the department account template | Yes |
+  | `GRANT_ACCESS` | Grant additional access on a system | Yes |
+  | `REVOKE_ACCESS` | Revoke access on expiry (only invoked by the system) | Yes |
+
+- **Main flow — entitlement catalog:** tab *Entitlement catalog* → choose a department → declare the entitlements / account templates the AI may grant to that department, with a maximum duration → `updateDepartmentEntitlements` → audit
+- **Exceptions:** connector does not exist → `400`; entitlement references a system without a connector → `400`; threshold outside 0.00–1.00 → `400`
+- **Permission:** `workflowConfigManage`
+- **Result:** the AI only self-approves requests that are in an enabled whitelist entry **and** in the beneficiary department's entitlement catalog
+
+### UC-WF-04 Route ticket
+
+- **Actors:** Requester; AI Service
+- **Trigger:** a new ticket is created from the support mailbox (`EMAIL`) or the portal (`PORTAL`), the requester answers an AI question, or a re-route is requested (UC-WF-11)
+- **Main flow:**
+  1. The AI Service (F04) reads the **full ticket** — request, requester and source — and returns the analysis: request type, `domain/subcategory`, **support level** (`L1` / `L2`), extracted fields, missing fields, confidence and a suggested priority (see *What F05 reads from each ticket*)
+  2. The system **auto-fills** the ticket fields marked "Filled by AI" (`AUTO_FILL_FIELDS`, BR-WF-21)
+  3. The system **sets the priority** — the AI's priority when confident, otherwise P2 — and attaches the SLA (`SET_PRIORITY`, BR-WF-20)
+  4. The system places the ticket in the **group** of its domain and the **sub-group** of its subcategory (BR-WF-09)
+  5. The system checks for **duplicate and similar tickets** (UC-WF-10): a duplicate of the requester's own open ticket is merged and routing stops; a ticket related to another person's open ticket keeps the same owner
+  6. The system writes an `ai_decisions` record and selects the flow according to the *Routing principles* table; the owner is the domain's **AI agent** (flows A and B, when `AGENT_FIRST` is on) or a **technician** (flow C)
+  7. Flow A → UC-WF-07; flow C → UC-WF-05
+- **Alternative — sender unknown** (external address, shared mailbox): fields stay empty, the ticket is never automated → flow C with reason `UNKNOWN_SENDER`
+- **Alternative — no AI agent for the domain**, or `AGENT_FIRST` off → flows A and B are handled by the AI Service without an agent owner; flow C unchanged
+- **Alternative — a technician or the Admin corrects the category or support level** before work starts → the ticket is routed again from step 4; the correction and its reason are audited
+- **Alternative — clarification (flow B):** confidence < threshold or a required field is missing → the AI sends a specific question to the requester (e.g. *"Which system do you need access to?"*) → ticket `NEEDS_INFO` → requester answers → back to step 1. Still not confident after 2 rounds → flow C
+- **Alternative — requester does not answer:** see UC-WF-06 (reminders and auto-close)
+- **Exception:** AI Service unavailable / error → ticket goes to flow C with reason `AI_UNAVAILABLE`
+- **Permission:** create ticket: `ticketCreate`; answer: ticket owner
+- **Result:** each ticket has its fields filled, a priority and an SLA, a group and sub-group, an owner (AI agent or technician), and exactly one current routing decision with its grounds, recorded in the audit log
+
+### UC-WF-05 Auto-assign technician
+
+- **Actors:** Technician (assignee); Admin (manual reassignment, last resort); AI Service (provides the summary)
+- **Trigger:** a ticket enters flow C (needs a human, out of scope, policy check failed, clarification limit reached), a ticket is returned from UC-WF-09, or a technician becomes eligible again (status back to `ON`, load below the maximum)
+- **Main flow:** the system takes the **group** and **sub-group** set in UC-WF-04 (domain → group, subcategory → sub-group, F09) → uses the sub-group, or the group when no sub-group handles the subcategory → applies the *Selection rule* (members who are `ON`, below maximum load, lowest workload score) → creates an assignment record → ticket `ASSIGNED` → sends a notification including **the AI summary and the reason it was routed to a human** → audit with source `AUTOMATION`, the category, the team and the workload scores compared
+- **Alternatives:**
+  - No group owns the domain, or the AI could not classify the ticket → the **default support team** is used; same selection rule
+  - Nobody in the team is eligible → the ticket waits in the team queue; the first technician who becomes eligible receives it automatically
+  - A technician switches to `OFF` → their **not-started** tickets (`ASSIGNED`) are reassigned with the same selection rule; tickets `IN_PROGRESS` stay with them unless the SLA is breached (UC-WF-06)
+  - Admin reassigns manually → `reassignTicket` with a mandatory reason → audit with before/after values
+- **Permission:** automatic: internal system; manual reassignment: `ticketReassign` (Admin only)
+- **Result:** every ticket that needs a human is assigned to the least-loaded technician who is `ON` in the right sub-group or group, without anyone distributing work by hand
+
+### UC-WF-06 Response reminders and SLA warnings
+
+- **Actors:** Technician, Admin, Requester (notification recipients)
+- **Trigger:** automatic — a system job runs every minute
+- **Main flow — warning:** ticket reaches the warning threshold → reminder to the assignee (once per threshold) → `SLA_WARNING` event recorded
+- **Main flow — breach:** deadline passed → flag `sla_breached` → if configured, raise priority by one level → **if the ticket is not started (`ASSIGNED`) or its assignee is now `OFF`, reassign it automatically** with the selection rule (UC-WF-05) → notify the Admin → `SLA_BREACHED` event recorded. A ticket `IN_PROGRESS` whose assignee is `ON` stays with them (the work already done is not lost).
+- **Main flow — waiting for requester:** ticket in `NEEDS_INFO`, or `RESOLVED` awaiting confirmation → remind the requester on day 1 and day N−1 → on day N (default 5 business days) `NEEDS_INFO` becomes `CLOSED` with reason *no response*; the requester can reopen within 7 days
+- **Exception:** `AUTOMATING` tickets are never auto-closed (BR-WF-11)
+- **Permission:** internal system
+- **Result:** no ticket becomes overdue without someone being notified
+
+### UC-WF-07 AI approves in-scope request
+
+- **Actors:** AI Service; Requester (receives the result)
+- **Trigger:** UC-WF-04 places the ticket in flow A
+- **Preconditions:** `AUTO_APPROVE` is enabled; confidence ≥ threshold; required information is complete
+- **Main flow:**
+  1. The system runs the **deterministic policy check** on the information extracted by the AI:
+     - the operation is in an enabled whitelist entry;
+     - the entitlement / account template is in the beneficiary department's catalog;
+     - duration ≤ maximum duration;
+     - the beneficiary is the requester, or in the same department as the requester (BR-WF-16);
+     - the beneficiary does not already have that access (avoid duplicate grants).
+  2. All pass → `ai_decisions.outcome = AUTO_APPROVED` with the result of each condition → ticket `AUTOMATING` → triggers UC-WF-08
+  3. Notify the requester: *"Your request has been approved automatically and is being processed"*
+- **Alternatives:**
+  - `CHECK_ACCOUNT` (read-only) → only checks the whitelist and that the requester may view that account, then proceeds to UC-WF-08
+  - Any condition fails → `ROUTE_TO_HUMAN` with a specific reason (e.g. *"Entitlement X is not in the Accounting catalog"*) → UC-WF-05
+  - Beneficiary already has the access → ticket `RESOLVED` with the message *"You already have this access"*
+- **Exception:** the AI Service returns invalid output (missing fields, wrong format) → flow C
+- **Permission:** internal system; the AI can never approve outside the whitelist and the entitlement catalog (BR-WF-02)
+- **Result:** basic requests are approved within seconds without human involvement; every decision has grounds the Admin can review
+
+### UC-WF-08 Execute request via API
+
+- **Actor:** Requester (receives the result)
+- **Trigger:** automatically right after AI approval (`AiDecisionApproved` event), or when a technician clicks *Retry* (UC-WF-09)
+- **Preconditions:** decision `AUTO_APPROVED`; the whitelist and entitlement catalog **at execution time** still allow it (BR-WF-12)
+- **Main flow:** the system creates a `workflow_run` with idempotency key = `decisionId + action` → calls the connector of the external access-management system → stores each call in `workflow_run_attempts` (request/response with sensitive data masked) → success → UC-WF-09 verification step → if the access is time-bound, schedule revocation
+- **Alternatives:**
+  - `CHECK_ACCOUNT` → the check result is sent to the requester, ticket `RESOLVED`
+  - Transient error (timeout, `5xx`, `429`) → `RETRY_WAIT` → up to 3 retries, 1 / 5 / 15 minutes apart
+  - Permanent error (business `4xx`, permission denied) or retries exhausted → `FAILED` → UC-WF-09 failure branch
+  - Revocation due → create a `workflow_run` with `REVOKE_ACCESS`, notify the user 1 day in advance
+- **Exception:** preconditions not met → no API call, `FAILED` with code `PRECONDITION_FAILED`
+- **Permission:** internal system; connectors use least-privilege service accounts
+- **Result:** one approval decision leads to **exactly one** change in the external access-management system
+
+### UC-WF-09 Verify result, hand off on failure
+
+- **Actors:** Requester (confirms the result), Technician (handles failures)
+- **Trigger:** automatically after UC-WF-08 finishes
+- **Main flow — verification:** the system calls the connector's check operation (e.g. the account exists, the user is in the access group) → match → `workflow_run` `SUCCEEDED` → ticket `RESOLVED` → notify the requester → requester clicks *Confirm* → `confirmTicketResolution` → `CLOSED`
+- **Alternative — requester reports not fixed:** `reopenTicket` → assigned to a technician of the owning team (UC-WF-05)
+- **Alternative — failure:** `workflow_run` `FAILED` or verification mismatch → the AI first checks whether the failure means the ticket was **sent to the wrong target** (UC-WF-11); if not, it is assigned to a technician of the owning team with the error code, failed step and attempt history → the technician opens SCR-T-02 tab *Automation*:
+  - *Retry* → `retryWorkflowRun` → back to UC-WF-08 (policy re-checked)
+  - *Resolved manually* (note required) → `resolveWorkflowRunManually` → `MANUALLY_RESOLVED`, ticket `RESOLVED`
+- **Exception:** retry when the current policy no longer allows it → `409`
+- **Permission:** confirm: ticket owner; retry / manual resolution: `workflowRunRetry` + assignee or Admin
+- **Result:** a ticket is never marked resolved without successful verification or a technician's confirmation (BR-WF-13)
+
+### UC-WF-10 Handle duplicate and similar tickets
+
+> **Split with F04 and F03.** F04 *finds* the candidates (UC-AI-06: similarity 0–100 %, duplicate threshold, warning to the requester before submitting, suggested-bug bursts). F03 *stores* the links (link / merge). F05 decides **what the workflow does automatically** with them, so that the same problem is not handled twice.
+
+- **Actors:** Requester (merged ticket, undo); Technician (owner of related tickets, unlink); Admin (configuration, possible-incident alert); AI Service (finds candidates)
+- **Trigger:** UC-WF-04 step 5, for every new ticket and every re-route, when `HANDLE_DUPLICATES` is on
+- **Preconditions:** the F04 analysis lists candidates with their similarity, filtered to open tickets
+- **Main flow — duplicate of the requester's own open ticket** (similarity ≥ duplicate threshold, same requester, the earlier ticket is not `RESOLVED`, `CLOSED` or `CANCELLED`; typically an email sent twice, or *Submit anyway* on the portal):
+  1. The system links the new ticket to the earlier one as **duplicate** (F03 link operation) and copies its text and attachments as a comment on the earlier ticket
+  2. The new ticket becomes `CLOSED` with reason *"Duplicate of #T-1024"*; it consumes no SLA and is never assigned
+  3. The requester is notified: *"Your request was added to your open ticket #T-1024"*, with a **Not the same problem** action valid for 7 days
+  4. The owner of the earlier ticket (AI agent or technician) is notified of the new comment
+- **Main flow — related to another person's open ticket** (similarity ≥ duplicate threshold, different requester, same system):
+  1. The new ticket is **not** closed — each requester gets their own answer
+  2. The system links both tickets as **related** and routes the new one to the **same owner** as the open ticket, instead of the workload selection (UC-WF-05), when that owner is still able to take it (`ON` and below the maximum load, or an AI agent)
+  3. The owner is notified that a related ticket was added; resolving the main ticket lets the owner resolve the related ones together (F03)
+- **Main flow — burst of similar tickets** (at least 5 similar open tickets on the same system within 60 minutes; F04 flags them `SUSPECTED_BUG`):
+  1. The oldest open ticket becomes the **main ticket**; the others are linked to it as related and routed to its owner
+  2. The main ticket's priority is raised by one level (never above P1) and its SLA recalculated
+  3. The Admin is notified once per burst: *"Possible incident: 5 similar tickets on SAP in 60 minutes"*
+- **Alternatives:**
+  - The earlier ticket is already `RESOLVED`, `CLOSED` or `CANCELLED` → no merge; the new ticket is routed normally and the earlier one is shown to the owner as a similar past ticket (F04)
+  - The owner of the open ticket is `OFF` or at maximum load → the new ticket is linked as related but assigned by the normal selection rule (UC-WF-05)
+  - The requester chooses **Not the same problem** within 7 days → the link is removed, the ticket is reopened as `NEW` and routed normally; the pair is never merged again
+  - A technician or the Admin chooses **Unlink** with a reason (SCR-WF-23) → the link is removed, the ticket is routed normally; the pair is never linked again
+  - Candidate below the duplicate threshold → nothing is linked automatically; F04 still shows it to the technician as similar
+- **Exceptions:** a requester never sees, and is never merged into, another person's ticket (BR-AI-08); a merge never crosses requesters
+- **Permission:** automatic: internal system; undo: ticket owner (requester); unlink: assigned technician or Admin
+- **Result:** the same problem is handled once by one owner; repeated messages from the same requester do not create parallel work; bursts surface as a possible incident
+
+### UC-WF-11 AI re-routes a ticket when processing fails or it was misrouted
+
+> **Split with F04 and F03.** F04 already re-classifies **once inside the first analysis** when the domain agent answers `WRONG_DOMAIN` (UC-AI-01 step 8). F03 lets people **transfer or escalate within the same division**. UC-WF-11 covers what happens **after** the ticket was routed: the AI routes it again, automatically, when the first route turns out to be wrong or the chosen handler fails.
+
+- **Actors:** AI Service (re-classifies); Technician (returns a misrouted ticket, receives re-routed tickets); Admin (configuration, loop alert); Requester (sees the routing history)
+- **Trigger** (when `AUTO_REROUTE` is on) — one of these **re-route reasons**:
+
+  | Reason code | Signal |
+  |---|---|
+  | `RETURNED_MISROUTED` | The assigned technician clicks *Return for re-routing* (SCR-WF-24) with a reason, e.g. *"This is an SAP authorization problem, not a network issue"* |
+  | `AGENT_WRONG_DOMAIN` | The domain AI agent, while working on the ticket, finds it belongs to another domain |
+  | `AGENT_NOT_SOLVED` | The domain AI agent cannot resolve the ticket (no allowed action, no self-service fix, the requester answered *Not solved*) or does not answer within its time budget |
+  | `AUTOMATION_WRONG_TARGET` | An API execution failed with an error showing the account, entitlement or system belongs to another domain (e.g. *"user not found in this directory"*) |
+
+- **Main flow — misrouted** (`RETURNED_MISROUTED`, `AGENT_WRONG_DOMAIN`, `AUTOMATION_WRONG_TARGET`):
+  1. The system asks the AI Service for a **new analysis** of the ticket, giving it the technician's reason or the agent / API error as extra context and the group just left as **excluded**
+  2. A new `ai_decisions` version is stored with the reason code; the previous decision is kept
+  3. The ticket goes through routing again (UC-WF-04 from step 4): new group and sub-group, new owner (AI agent or technician), new flow
+  4. The new owner is notified with the AI summary **and the routing history** (previous group, who returned it and why)
+  5. The requester sees *"Your request was moved to the right team"* in the ticket timeline
+- **Main flow — agent could not resolve** (`AGENT_NOT_SOLVED`): the domain is right, the handler is wrong → the ticket stays in its group and sub-group and goes to flow C: a technician is chosen by the selection rule (UC-WF-05), with the agent's attempt in the summary
+- **Alternatives — loop protection:**
+  - The new analysis points to the **same group** that was just left → the ticket goes to the **default support team** instead
+  - The ticket has already been re-routed the **maximum number of times** (default 2) → no new AI routing: it goes to the default support team with reason `REROUTE_LIMIT_REACHED`, and the Admin is notified
+  - The AI Service is unavailable or returns an invalid analysis → default support team with reason `AI_UNAVAILABLE`
+- **Rules:** the SLA is **not reset** by a re-route (BR-WF-08); the priority is kept unless the new analysis sets a higher one; fields corrected by a person are kept; a duplicate link (UC-WF-10) is kept
+- **Exceptions:** *Return for re-routing* without a reason → `400`; by someone other than the assigned technician or the Admin → `403`; on a `RESOLVED`, `CLOSED` or `CANCELLED` ticket → `409`
+- **Permission:** automatic: internal system; return for re-routing: assigned technician or Admin
+- **Result:** a misrouted or failed ticket reaches the right team without the requester resubmitting it and without a person dispatching it, and it can never bounce between teams endlessly
+
+**Related:** [Features](01-features.md) · [INVEST backlog](04-invest-requirements.md) · [Acceptance criteria](03-acceptance-criteria.md) · [Business rules](../requirements/business-rules.md)
